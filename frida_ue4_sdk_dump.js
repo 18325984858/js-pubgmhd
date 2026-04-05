@@ -25,7 +25,9 @@ var CONFIG = {
 	UProp_ArrayDimOff: 0x30,
 	UProp_ElementSizeOff: 0x34,
 	UProp_PropFlagsOff: 0x38,
+	UProp_RepIndexOff: 0x40,      // uint16 RepIndex (网络复制索引, 0xFFFF=不复制)
 	UProp_OffsetOff: 0x44,
+	UProp_RepNotifyFuncOff: 0x48, // FName RepNotifyFunc (属性变化通知函数名)
 	UFunc_FuncFlagsOff: 0x88,
 	UFunc_NumParmsOff: 0x8c,
 	// UFunction::Func (FNativeFuncPtr / PMF) — IDA 反编译验证:
@@ -264,6 +266,8 @@ function collectDeclaredFields(typePtr) {
 					offset: safeS32(child.add(CONFIG.UProp_OffsetOff)),
 					elemSize: safeS32(child.add(CONFIG.UProp_ElementSizeOff)),
 					arrayDim: safeS32(child.add(CONFIG.UProp_ArrayDimOff)),
+					repIndex: safeU32(child.add(CONFIG.UProp_RepIndexOff)) & 0xFFFF,
+					repNotifyFunc: readFName(child.add(CONFIG.UProp_RepNotifyFuncOff)),
 				});
 			} catch (_) {}
 		}
@@ -408,6 +412,8 @@ function dumpFieldEntries(file, fields, expanded) {
 		line += "; // 0x" + (field.offset >>> 0).toString(16).toUpperCase();
 		line += " (Size: 0x" + (field.elemSize >>> 0).toString(16).toUpperCase() + ")";
 		if (field.enumPath) line += " [UEnum: " + field.enumPath + "]";
+		if (field.repIndex !== 0xFFFF) line += " [RepIndex: " + field.repIndex + "]";
+		if (field.repNotifyFunc && field.repNotifyFunc !== "None" && field.repNotifyFunc !== "<invalid>") line += " [RepNotify: " + field.repNotifyFunc + "]";
 		if (expanded && CONFIG.AnnotateExpandedOwner) line += " [Owner: " + field.ownerName + "]";
 		bufferedWrite(file, line + "\n");
 	}

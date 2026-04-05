@@ -58,6 +58,11 @@ var CONFIG = {
 	PC_bIsObserverInBattleOff: 0x10F9, // bool bIsObserverInBattle
 	PC_bIsObserverHostOff: 0x10FA,     // bool bIsObserverHost
 
+	// 网络可见范围 (AActor)
+	Actor_NetCullDistSqOff: 0x208,     // float NetCullDistanceSquared
+	Actor_bAlwaysRelevantOff: 0x90,    // bool bAlwaysRelevant
+	Char_CurrentNetCullDistSqOff: 0x4600, // float CurrentNetCullDistanceSquared (STExtraBaseCharacter)
+
 	// Character 直读偏移 (用于 GUObjectArray 扫描)
 	Char_HealthOff: 0xfd8,            // float Health (STExtraCharacter)
 	Char_HealthMaxOff: 0xfe0,         // float HealthMax
@@ -201,6 +206,8 @@ var logFile = null;
 var logLineCount = 0;
 var characterClassSet = {};   // UClass* -> true, 缓存所有 Character 子类
 var myTeamID = -1;
+var lastReportedArrayNum = -1;
+var lastReportedTotal = -1;
 
 // ===================== 内存写入 ======================================
 // addr: 目标地址 (NativePointer 或数字/字符串)
@@ -489,6 +496,139 @@ function detectObserverType() {
 	writeLog(msg);
 }
 
+// 强制设置观战类型
+// obsType: 0=None, 1=InSpectating, 2=GlobalObserver, 3=FriendObserver, 4=Spectator
+function setObserverType(obsType) {
+	var pc = getLocalPlayerController();
+	if (pc.isNull()) {
+		send({ type: "error", msg: "[SetObserver] 无法获取 PlayerController" });
+		return false;
+	}
+	switch (obsType) {
+		case 0: // None — 普通玩家
+			writeMemory(pc.add(CONFIG.PC_bIsObserverOff), 1, 0);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverInBattleOff), 1, 0);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverHostOff), 1, 0);
+			break;
+		case 1: // InSpectating — 死亡后观战
+			writeMemory(pc.add(CONFIG.PC_bIsObserverOff), 1, 1);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverInBattleOff), 1, 1);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverHostOff), 1, 0);
+			break;
+		case 2: // GlobalObserver — 全局观战
+			writeMemory(pc.add(CONFIG.PC_bIsObserverOff), 1, 1);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverInBattleOff), 1, 0);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverHostOff), 1, 1);
+			break;
+		case 3: // FriendObserver — 好友观战
+			writeMemory(pc.add(CONFIG.PC_bIsObserverOff), 1, 1);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverInBattleOff), 1, 0);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverHostOff), 1, 0);
+			break;
+		case 4: // Spectator — 观众
+			writeMemory(pc.add(CONFIG.PC_bIsObserverOff), 1, 1);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverInBattleOff), 1, 0);
+			writeMemory(pc.add(CONFIG.PC_bIsObserverHostOff), 1, 0);
+			break;
+		default:
+			send({ type: "error", msg: "[SetObserver] 无效类型: " + obsType });
+			return false;
+	}
+	var typeName = EObserverTypeNames[obsType] || "Unknown";
+	send({ type: "info", msg: "[SetObserver] 已设置为 EObserverType_" + typeName + " (" + obsType + ")" });
+	writeLog("[SetObserver] -> EObserverType_" + typeName + " (" + obsType + ")");
+	return true;
+}
+
+// ===================== RPC 请求全部玩家信息 ===========================
+// 通过 UFunction 调用 RPC_Server_RequestAllPlayerInfo 请求服务端发送全部玩家数据
+// 服务端回传通过 RPC_Client_SyncAllPlayerInfo (Hook 捕获)
+
+function findUFunctionByName(classPtr, funcName) {
+	var child = safePtr(classPtr.add(0x38)); // UStruct::Children
+	var depth = 0;
+	while (!child.isNull() && depth < 2000) {
+		var name = readObjName(child);
+		if (name === funcName) return child;
+		child = safePtr(child.add(0x28)); // UField::Next
+		depth++;
+	}
+	// 搜索父类
+	var superClass = safePtr(classPtr.add(CONFIG.UStruct_SuperOff));
+	if (!superClass.isNull()) return findUFunctionByName(superClass, funcName);
+	return ptr(0);
+}
+
+function callRequestAllPlayerInfo() {
+	var pc = getLocalPlayerController();
+	if (pc.isNull()) {
+		send({ type: "error", msg: "[RPC] 无法获取 PlayerController" });
+		return false;
+	}
+
+	var classPtr = safePtr(pc.add(CONFIG.UObj_ClassOff));
+	if (classPtr.isNull()) {
+		send({ type: "error", msg: "[RPC] PlayerController class is NULL" });
+		return false;
+	}
+
+	var uFunc = findUFunctionByName(classPtr, "RPC_Server_RequestAllPlayerInfo");
+	if (uFunc.isNull()) {
+		send({ type: "error", msg: "[RPC] UFunction 'RPC_Server_RequestAllPlayerInfo' not found" });
+		return false;
+	}
+
+	// 获取 UFunction 的 native 函数指针 (+0xB0)
+	var nativeFunc = safePtr(uFunc.add(0xB0));
+	send({ type: "info", msg: "[RPC] Found UFunction at " + uFunc + " native=" + nativeFunc });
+
+	// 调用: 在客户端执行时走 RPC 发送路径 (sub_A5653FC "R")
+	var callRPC = new NativeFunction(nativeFunc, 'void', ['pointer', 'pointer']);
+	try {
+		callRPC(pc, uFunc);
+		send({ type: "info", msg: "[RPC] RPC_Server_RequestAllPlayerInfo 已发送!" });
+		return true;
+	} catch (e) {
+		send({ type: "error", msg: "[RPC] 调用失败: " + e.message });
+		return false;
+	}
+}
+
+// Hook RPC_Client_SyncAllPlayerInfo 接收服务端回传的全部玩家数据
+var syncHooked = false;
+function hookSyncAllPlayerInfo() {
+	if (syncHooked) return;
+	var addr = gBase.add(0x6E898E0); // sub_6E898E0 = RPC_Client_SyncAllPlayerInfo impl
+	Interceptor.attach(addr, {
+		onEnter: function (args) {
+			var pcPtr = args[0];
+			var dataPtr = args[1];
+			send({ type: "info", msg: "[RPC-Recv] RPC_Client_SyncAllPlayerInfo 被调用! PC=" + pcPtr });
+			// 读取 TArray 数据: dataPtr 是 TArray<FAllPlayerInfo> 引用
+			if (!dataPtr.isNull()) {
+				var arrData = safePtr(dataPtr);
+				var arrNum = safeS32(dataPtr.add(8));
+				send({ type: "info", msg: "[RPC-Recv] InfoDataList: data=" + arrData + " num=" + arrNum });
+				if (arrNum > 0) {
+					send({ type: "info", msg: "[RPC-Recv] ★★★ 收到 " + arrNum + " 个玩家信息! ★★★" });
+				}
+			}
+		}
+	});
+	syncHooked = true;
+	send({ type: "info", msg: "[RPC] Hook RPC_Client_SyncAllPlayerInfo 已安装" });
+}
+
+// ===================== 修改网络可见范围 ==============================
+// 将角色的 NetCullDistanceSquared 设为极大值, 使服务器复制全地图玩家
+var MAX_CULL_DIST_SQ = 1.0e18; // ~316km 范围, 覆盖任何地图
+
+function patchActorNetCull(actorPtr) {
+	writeFloat(actorPtr.add(CONFIG.Actor_NetCullDistSqOff), MAX_CULL_DIST_SQ);
+	// STExtraBaseCharacter.CurrentNetCullDistanceSquared
+	writeFloat(actorPtr.add(CONFIG.Char_CurrentNetCullDistSqOff), MAX_CULL_DIST_SQ);
+}
+
 // ===================== GUObjectArray 扫描所有 Character ===============
 function scanCharacters() {
 	var arrayBase = gBase.add(CONFIG.GUObjectArray);
@@ -560,6 +700,9 @@ function scanCharacters() {
 
 				if (healthMax <= 0) continue; // 无效对象
 
+				// 修改每个 Character 的网络可见范围为全地图
+				patchActorNetCull(objPtr);
+
 				playerList.upsert(playerKey, {
 					teamID: teamID, playerName: playerName, isAI: false,
 					liveState: bDead ? 1 : 0,
@@ -579,7 +722,24 @@ function scanCharacters() {
 function updatePlayerList(gameStatePtr) {
 	var arrayData = safePtr(gameStatePtr.add(CONFIG.GameStateBase_PlayerArrayOff));
 	var arrayNum = safeS32(gameStatePtr.add(CONFIG.GameStateBase_PlayerArrayOff + 8));
-	if (arrayData.isNull() || arrayNum <= 0 || arrayNum > 200) return 0;
+
+	// 读取 GameState 的全局玩家计数
+	var totalPlayerNum = safeS32(gameStatePtr.add(CONFIG.UAEGameState_TotalPlayerNumOff));
+	var playerNum = safeS32(gameStatePtr.add(CONFIG.UAEGameState_PlayerNumOff));
+	var aliveNum = safeS32(gameStatePtr.add(0x129C));    // AlivePlayerNum
+	var aliveRealNum = safeS32(gameStatePtr.add(0x12A0)); // AliveRealPlayerNum
+
+	if (arrayNum !== lastReportedArrayNum || totalPlayerNum !== lastReportedTotal) {
+		send({ type: "info", msg: "[PlayerCount] PlayerArray=" + arrayNum
+			+ " TotalPlayerNum=" + totalPlayerNum
+			+ " PlayerNum=" + playerNum
+			+ " AlivePlayerNum=" + aliveNum
+			+ " AliveRealPlayerNum=" + aliveRealNum });
+		lastReportedArrayNum = arrayNum;
+		lastReportedTotal = totalPlayerNum;
+	}
+
+	if (arrayData.isNull() || arrayNum <= 0 || arrayNum > 500) return 0;
 
 	var seenKeys = {};
 	var updated = 0;
@@ -605,6 +765,7 @@ function updatePlayerList(gameStatePtr) {
 		if (!charOwner.isNull()) {
 			var loc = getActorLocation(charOwner);
 			if (loc) { posX = loc.x; posY = loc.y; posZ = loc.z; }
+			patchActorNetCull(charOwner);
 		}
 		// 退回读 SelfLocAndRot
 		if (posX === 0 && posY === 0 && posZ === 0) {
@@ -643,6 +804,9 @@ function pollPlayers() {
 		gNumNames = safeS32(gNamesArray.add(CONFIG.NumElementsOff));
 		var ms = getMatchState();
 		if (!ms.inMatch) return;
+
+		// 每次轮询都尝试请求全部玩家数据
+		//callRequestAllPlayerInfo();
 
 		var count = updatePlayerList(ms.gameStatePtr);
 		if (count <= 0) return;
@@ -709,11 +873,17 @@ function pollMatchState() {
 				playerList.clear();
 				characterClassSet = {};
 				myTeamID = -1;
+				lastReportedArrayNum = -1;
+				lastReportedTotal = -1;
 				openLog();
 				writeLog(">>> " + msg);
 				writeLog("World: " + ms.worldName);
 				writeLog("");
 				detectObserverType();
+				//setObserverType(2); // 强制切换为 GlobalObserver
+				//detectObserverType(); // 验证修改结果
+				
+				//callRequestAllPlayerInfo(); // 发送 RPC 请求全部玩家数据
 				if (!playerTimer) {
 					playerTimer = setInterval(pollPlayers, CONFIG.PlayerPollInterval);
 					send({ type: "info", msg: "玩家坐标采集已启动 (每" + CONFIG.PlayerPollInterval + "ms)" });
@@ -747,9 +917,9 @@ function startMonitor() {
 	isInMatch = false;
 	playerList.clear();
 
-	// Patch: MOV W0, WZR -> MOV W0, #2 at libUE4+0x5FB8970
-	writeMemory(gBase.add(0x5FB8970), 4, [0x40, 0x00, 0x80, 0x52]);
-
+	// Patch: MOV W0, WZR -> MOV W0, #2 at libUE4+0x9A49BF4
+	//writeMemory(gBase.add(0x9A49BF4), 4, [0x40, 0x00, 0x80, 0x52]);
+	//hookSyncAllPlayerInfo(); // Hook 接收回调
 	send({ type: "info", msg: "=== 对局监控+玩家采集已启动 (状态" + (CONFIG.PollInterval / 1000) + "s, 玩家" + CONFIG.PlayerPollInterval + "ms) ===" });
 
 	pollMatchState();
