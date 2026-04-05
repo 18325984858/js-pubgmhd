@@ -48,6 +48,16 @@ var CONFIG = {
 	Actor_RootComponentOff: 0x268,    // USceneComponent* RootComponent
 	SceneComp_TranslationOff: 0x200,  // ComponentToWorld.Translation (FVector)
 
+	// UWorld -> PlayerController 链路
+	UWorld_OwningGameInstanceOff: 0xB00,
+	GameInstance_LocalPlayersOff: 0x48, // TArray<ULocalPlayer*>
+	LocalPlayer_PlayerControllerOff: 0x30, // UPlayer::PlayerController
+
+	// UAEPlayerController 观战相关
+	PC_bIsObserverOff: 0x10F8,         // bool bIsObserver
+	PC_bIsObserverInBattleOff: 0x10F9, // bool bIsObserverInBattle
+	PC_bIsObserverHostOff: 0x10FA,     // bool bIsObserverHost
+
 	// Character 直读偏移 (用于 GUObjectArray 扫描)
 	Char_HealthOff: 0xfd8,            // float Health (STExtraCharacter)
 	Char_HealthMaxOff: 0xfe0,         // float HealthMax
@@ -434,6 +444,51 @@ function isSubclassOf(classPtr, targetName) {
 	return false;
 }
 
+// ===================== EObserverType 检测 =============================
+var EObserverTypeNames = [
+	"None",           // 0 — 普通玩家
+	"InSpectating",   // 1 — 死亡后观战
+	"GlobalObserver", // 2 — 全局观战
+	"FriendObserver", // 3 — 好友观战
+	"Spectator",      // 4 — 观众
+];
+
+function getLocalPlayerController() {
+	var worldPtr = safePtr(gBase.add(CONFIG.GWorld));
+	if (worldPtr.isNull()) return ptr(0);
+	var gsPtr = safePtr(worldPtr.add(CONFIG.UWorld_GameStateOff));
+	if (gsPtr.isNull()) return ptr(0);
+	var arrayData = safePtr(gsPtr.add(CONFIG.GameStateBase_PlayerArrayOff));
+	var arrayNum = safeS32(gsPtr.add(CONFIG.GameStateBase_PlayerArrayOff + 8));
+	if (arrayData.isNull() || arrayNum <= 0) return ptr(0);
+	var psPtr = safePtr(arrayData); // PlayerArray[0] = 本地玩家 PlayerState
+	if (psPtr.isNull()) return ptr(0);
+	return safePtr(psPtr.add(0x98)); // AActor::Owner = PlayerController
+}
+
+function detectObserverType() {
+	var pc = getLocalPlayerController();
+	if (pc.isNull()) {
+		send({ type: "info", msg: "[ObserverType] 无法获取本地 PlayerController" });
+		return;
+	}
+	var bIsObserver = safeU8(pc.add(CONFIG.PC_bIsObserverOff)) !== 0;
+	var bInBattle = safeU8(pc.add(CONFIG.PC_bIsObserverInBattleOff)) !== 0;
+	var bIsHost = safeU8(pc.add(CONFIG.PC_bIsObserverHostOff)) !== 0;
+
+	var obsType = 0; // None
+	if (bIsObserver) {
+		if (bIsHost) obsType = 2;       // GlobalObserver
+		else if (bInBattle) obsType = 1; // InSpectating
+		else obsType = 4;                // Spectator
+	}
+	var typeName = EObserverTypeNames[obsType] || "Unknown";
+	var detail = "bIsObserver=" + bIsObserver + " bInBattle=" + bInBattle + " bIsHost=" + bIsHost;
+	var msg = "[ObserverType] 当前以 EObserverType_" + typeName + " (" + obsType + ") 进入对局 [" + detail + "]";
+	send({ type: "info", msg: msg });
+	writeLog(msg);
+}
+
 // ===================== GUObjectArray 扫描所有 Character ===============
 function scanCharacters() {
 	var arrayBase = gBase.add(CONFIG.GUObjectArray);
@@ -658,6 +713,7 @@ function pollMatchState() {
 				writeLog(">>> " + msg);
 				writeLog("World: " + ms.worldName);
 				writeLog("");
+				detectObserverType();
 				if (!playerTimer) {
 					playerTimer = setInterval(pollPlayers, CONFIG.PlayerPollInterval);
 					send({ type: "info", msg: "玩家坐标采集已启动 (每" + CONFIG.PlayerPollInterval + "ms)" });
