@@ -13,6 +13,7 @@ var CONFIG = {
 	NumElementsOff: 0x1400,
 	NameEntryIndexOff: 0x08,
 	NameEntryNameOff: 0x0c,
+	UObj_FlagsOff: 0x08,
 	UObj_ClassOff: 0x10,
 	UObj_NameIdxOff: 0x18,
 	UObj_NameNumOff: 0x1c,
@@ -33,11 +34,30 @@ var CONFIG = {
 	UFunc_FuncPtrOff: 0xb0,
 	// UEnum: CppType(FString=0x10 bytes) starts at +0x30, Names(TArray) at +0x40
 	UEnum_NamesOff: 0x40,
+	// Verified from the target dump: Property/NumericProperty are 0x70 bytes,
+	// ByteProperty is 0x78, and EnumProperty is 0x80.
+	UByteProp_EnumOff: 0x70,
+	UEnumProp_UnderlyingPropOff: 0x70,
+	UEnumProp_EnumOff: 0x78,
 	ObjChunkPtrsOff: 0xc8,
 	ObjChunkCountsOff: 0xe8,
 	ObjNumChunksOff: 0xf8,
 	ObjTotalNumOff: 0x100,
 	FUObjectItemSize: 24,
+	RF_ClassDefaultObject: 0x10,
+	ExpandInheritedMembers: true,
+	AnnotateExpandedOwner: true,
+	EnableVTableDump: true,
+	// chain: output every valid slot together with the class that currently provides it.
+	// diff: output only slots changed from the immediate parent class.
+	VTableDumpMode: "chain",
+	VTableMaxSlots: 768,
+	VTableStopAfterInvalid: 32,
+	AnnotateVTableUFunctions: true,
+	MaxVTableUFunctionMatches: 4,
+	OutputBufferBytes: 0x40000,
+	UClassScanStartOff: 0x28,
+	UClassScanMaxOff: 0x400,
 	OutputDir: "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/",
 };
 
@@ -45,7 +65,16 @@ var gBase = null,
 	gModSize = 0,
 	gNamesArray = null,
 	gNumNames = 0,
-	nameCache = {};
+	nameCache = {},
+	classDefaultObjectCache = {},
+	typeHierarchyCache = {},
+	classHierarchyCache = {},
+	declaredFieldCache = {},
+	declaredFunctionCache = {},
+	nativeUFunctionMap = {},
+	vtableInfoCache = {},
+	outputBufferParts = [],
+	outputBufferBytes = 0;
 
 function safePtr(a) {
 	try {
@@ -67,6 +96,460 @@ function safeU32(a) {
 	} catch (_) {
 		return 0;
 	}
+}
+
+function isModulePtr(p) {
+	if (p.isNull() || gBase === null) return false;
+	try {
+		var off = p.sub(gBase);
+		return off.compare(0) >= 0 && off.compare(gModSize) < 0;
+	} catch (_) {
+		return false;
+	}
+}
+
+function getModuleOffsetText(p) {
+	try {
+		return "0x" + p.sub(gBase).toString(16).toUpperCase();
+	} catch (_) {
+		return p.toString();
+	}
+}
+
+function flushBuffered(file) {
+	if (outputBufferParts.length === 0) return;
+	file.write(outputBufferParts.join(""));
+	outputBufferParts = [];
+	outputBufferBytes = 0;
+}
+
+function bufferedWrite(file, text) {
+	outputBufferParts.push(text);
+	outputBufferBytes += text.length;
+	if (outputBufferBytes >= CONFIG.OutputBufferBytes) flushBuffered(file);
+}
+
+function getObjectFlags(objPtr) {
+	return safeU32(objPtr.add(CONFIG.UObj_FlagsOff));
+}
+
+function isClassDefaultObject(classPtr, objPtr) {
+	if (objPtr.isNull()) return false;
+	if ((getObjectFlags(objPtr) & CONFIG.RF_ClassDefaultObject) === 0) return false;
+	var objClass = safePtr(objPtr.add(CONFIG.UObj_ClassOff));
+	return !objClass.isNull() && objClass.compare(classPtr) === 0;
+}
+
+function findClassDefaultObject(classPtr) {
+	var key = classPtr.toString();
+	if (key in classDefaultObjectCache) return classDefaultObjectCache[key];
+
+	var cdo = ptr(0);
+	for (var off = CONFIG.UClassScanStartOff; off < CONFIG.UClassScanMaxOff; off += Process.pointerSize) {
+		var candidate = safePtr(classPtr.add(off));
+		if (isClassDefaultObject(classPtr, candidate)) {
+			cdo = candidate;
+			break;
+		}
+	}
+
+	classDefaultObjectCache[key] = cdo;
+	return cdo;
+}
+
+function buildTypeHierarchy(typePtr) {
+	var key = typePtr.toString();
+	if (key in typeHierarchyCache) return typeHierarchyCache[key];
+
+	var chain = [];
+	var seen = {};
+	var cur = typePtr;
+	var depth = 0;
+	while (!cur.isNull() && depth < 256) {
+		var curKey = cur.toString();
+		if (curKey in seen) break;
+		seen[curKey] = true;
+		chain.unshift(cur);
+		cur = safePtr(cur.add(CONFIG.UStruct_SuperOff));
+		depth++;
+	}
+
+	var hierarchy = [];
+	for (var i = 0; i < chain.length; i++) {
+		hierarchy.push({
+			ptr: chain[i],
+			name: fn(chain[i]),
+		});
+	}
+
+	typeHierarchyCache[key] = hierarchy;
+	return hierarchy;
+}
+
+function getValidVTableTarget(vtable, slotOff) {
+	if (vtable.isNull()) return ptr(0);
+	var target = safePtr(vtable.add(slotOff));
+	if (target.isNull() || !isModulePtr(target)) return ptr(0);
+	return target;
+}
+
+function buildClassHierarchy(classPtr) {
+	var key = classPtr.toString();
+	if (key in classHierarchyCache) return classHierarchyCache[key];
+
+	var typeHierarchy = buildTypeHierarchy(classPtr);
+	var hierarchy = [];
+	for (var i = 0; i < typeHierarchy.length; i++) {
+		var cls = typeHierarchy[i].ptr;
+		var cdo = findClassDefaultObject(cls);
+		hierarchy.push({
+			ptr: cls,
+			name: typeHierarchy[i].name,
+			cdo: cdo,
+			vtable: cdo.isNull() ? ptr(0) : safePtr(cdo),
+		});
+	}
+
+	classHierarchyCache[key] = hierarchy;
+	return hierarchy;
+}
+
+function getHierarchyText(hierarchy) {
+	var names = [];
+	for (var i = 0; i < hierarchy.length; i++) names.push(hierarchy[i].name);
+	return names.join(" -> ");
+}
+
+function getFunctionFlagsList(funcFlags) {
+	var flags = [];
+	if (funcFlags & 0x00000001) flags.push("Final");
+	if (funcFlags & 0x00000002) flags.push("Static");
+	if (funcFlags & 0x00000400) flags.push("Native");
+	if (funcFlags & 0x00000800) flags.push("Event");
+	if (funcFlags & 0x00002000) flags.push("NetMulticast");
+	if (funcFlags & 0x00020000) flags.push("Net");
+	if (funcFlags & 0x00200000) flags.push("BlueprintCallable");
+	if (funcFlags & 0x00400000) flags.push("BlueprintEvent");
+	if (funcFlags & 0x04000000) flags.push("Exec");
+	return flags;
+}
+
+function getFunctionLocationSuffix(funcPtr) {
+	if (funcPtr.isNull()) return "";
+	var off = funcPtr.sub(gBase);
+	if (off.compare(0) > 0 && off.compare(gModSize) < 0) {
+		return " // [Offset: 0x" + off.toString(16).toUpperCase() + "]";
+	}
+	return " // [Addr: " + funcPtr + "]";
+}
+
+function collectDeclaredFields(typePtr) {
+	var key = typePtr.toString();
+	if (key in declaredFieldCache) return declaredFieldCache[key];
+
+	var ownerName = fn(typePtr);
+	var fields = [];
+	var child = safePtr(typePtr.add(CONFIG.UStruct_ChildrenOff));
+	var depth = 0;
+	while (!child.isNull() && depth < 5000) {
+		var cc = cn(child);
+		if (cc.length > 8 && cc.substring(cc.length - 8) === "Property") {
+			try {
+				var fieldType = getFieldTypeInfo(child);
+				fields.push({
+					ownerName: ownerName,
+					propName: fn(child),
+					typeName: fieldType.typeName,
+					enumPath: fieldType.enumPath,
+					offset: safeS32(child.add(CONFIG.UProp_OffsetOff)),
+					elemSize: safeS32(child.add(CONFIG.UProp_ElementSizeOff)),
+					arrayDim: safeS32(child.add(CONFIG.UProp_ArrayDimOff)),
+				});
+			} catch (_) {}
+		}
+		child = safePtr(child.add(CONFIG.UField_NextOff));
+		depth++;
+	}
+
+	declaredFieldCache[key] = fields;
+	return fields;
+}
+
+function collectExpandedFields(typePtr) {
+	if (!CONFIG.ExpandInheritedMembers) return collectDeclaredFields(typePtr);
+	var hierarchy = buildTypeHierarchy(typePtr);
+	var fields = [];
+	for (var i = 0; i < hierarchy.length; i++) {
+		var declared = collectDeclaredFields(hierarchy[i].ptr);
+		for (var j = 0; j < declared.length; j++) fields.push(declared[j]);
+	}
+	return fields;
+}
+
+function collectDeclaredFunctions(typePtr) {
+	var key = typePtr.toString();
+	if (key in declaredFunctionCache) return declaredFunctionCache[key];
+
+	var ownerName = fn(typePtr);
+	var functions = [];
+	var child = safePtr(typePtr.add(CONFIG.UStruct_ChildrenOff));
+	var depth = 0;
+	while (!child.isNull() && depth < 5000) {
+		if (cn(child) === "Function") {
+			try {
+				var funcFlags = safeS32(child.add(CONFIG.UFunc_FuncFlagsOff));
+				var numParms = safeS32(child.add(CONFIG.UFunc_NumParmsOff)) & 0xff;
+				var params = [];
+				var retType = "void";
+				var fparam = safePtr(child.add(CONFIG.UStruct_ChildrenOff));
+				var pd = 0;
+				while (!fparam.isNull() && pd < 100) {
+					var pc = cn(fparam);
+					if (pc.length > 8 && pc.substring(pc.length - 8) === "Property") {
+						var pn = fn(fparam);
+						var pt = getPropType(fparam);
+						var pf = readPropFlags(fparam);
+						if (pf.lo & 0x400) {
+							retType = pt;
+						} else if (pf.lo & 0x80) {
+							params.push((pf.lo & 0x100 ? "out " : "") + pt + " " + pn);
+						}
+					}
+					fparam = safePtr(fparam.add(CONFIG.UField_NextOff));
+					pd++;
+				}
+
+				var funcPtr = safePtr(child.add(CONFIG.UFunc_FuncPtrOff));
+				functions.push({
+					ownerName: ownerName,
+					funcName: fn(child),
+					funcFlags: funcFlags,
+					flagNames: getFunctionFlagsList(funcFlags),
+					numParms: numParms,
+					params: params,
+					retType: retType,
+					funcPtr: funcPtr,
+					locationSuffix: getFunctionLocationSuffix(funcPtr),
+					qualifiedName: ownerName + "::" + fn(child),
+				});
+			} catch (_) {}
+		}
+		child = safePtr(child.add(CONFIG.UField_NextOff));
+		depth++;
+	}
+
+	declaredFunctionCache[key] = functions;
+	return functions;
+}
+
+function collectExpandedFunctions(typePtr) {
+	if (!CONFIG.ExpandInheritedMembers) return collectDeclaredFunctions(typePtr);
+	var hierarchy = buildTypeHierarchy(typePtr);
+	var functions = [];
+	for (var i = 0; i < hierarchy.length; i++) {
+		var declared = collectDeclaredFunctions(hierarchy[i].ptr);
+		for (var j = 0; j < declared.length; j++) functions.push(declared[j]);
+	}
+	return functions;
+}
+
+function registerNativeUFunction(funcInfo) {
+	if (funcInfo.funcPtr.isNull() || !isModulePtr(funcInfo.funcPtr)) return;
+	var key = funcInfo.funcPtr.toString();
+	if (!(key in nativeUFunctionMap)) nativeUFunctionMap[key] = [];
+	var list = nativeUFunctionMap[key];
+	for (var i = 0; i < list.length; i++) {
+		if (list[i] === funcInfo.qualifiedName) return;
+	}
+	list.push(funcInfo.qualifiedName);
+}
+
+function buildNativeUFunctionMap(targets) {
+	nativeUFunctionMap = {};
+	var totalFunctions = 0;
+	var indexedFunctions = 0;
+	for (var i = 0; i < targets.length; i++) {
+		var declared = collectDeclaredFunctions(targets[i]);
+		for (var j = 0; j < declared.length; j++) {
+			totalFunctions++;
+			var before = Object.prototype.hasOwnProperty.call(nativeUFunctionMap, declared[j].funcPtr.toString())
+				? nativeUFunctionMap[declared[j].funcPtr.toString()].length
+				: 0;
+			registerNativeUFunction(declared[j]);
+			if (!declared[j].funcPtr.isNull() && isModulePtr(declared[j].funcPtr)) {
+				var after = nativeUFunctionMap[declared[j].funcPtr.toString()].length;
+				if (after > before) indexedFunctions++;
+			}
+		}
+	}
+	send({ type: "info", msg: "Indexed " + indexedFunctions + " native UFunctions from " + totalFunctions + " reflected functions." });
+}
+
+function getVTableUFunctionAnnotation(target) {
+	if (!CONFIG.AnnotateVTableUFunctions) return "";
+	var key = target.toString();
+	if (!(key in nativeUFunctionMap)) return "";
+	var list = nativeUFunctionMap[key];
+	if (!list || list.length === 0) return "";
+	var shown = list.slice(0, CONFIG.MaxVTableUFunctionMatches);
+	var text = " [UFunction: " + shown.join(" | ");
+	if (list.length > shown.length) text += " | +" + (list.length - shown.length) + " more";
+	text += "]";
+	return text;
+}
+
+function dumpFieldEntries(file, fields, expanded) {
+	if (fields.length === 0) return false;
+	bufferedWrite(file, "\t// Fields" + (expanded ? " (Expanded Inheritance)" : "") + "\n");
+	for (var i = 0; i < fields.length; i++) {
+		var field = fields[i];
+		var line = "\t" + field.typeName + " " + field.propName;
+		if (field.arrayDim > 1) line += "[" + field.arrayDim + "]";
+		line += "; // 0x" + (field.offset >>> 0).toString(16).toUpperCase();
+		line += " (Size: 0x" + (field.elemSize >>> 0).toString(16).toUpperCase() + ")";
+		if (field.enumPath) line += " [UEnum: " + field.enumPath + "]";
+		if (expanded && CONFIG.AnnotateExpandedOwner) line += " [Owner: " + field.ownerName + "]";
+		bufferedWrite(file, line + "\n");
+	}
+	return true;
+}
+
+function dumpFunctionEntries(file, functions, expanded) {
+	if (functions.length === 0) return false;
+	bufferedWrite(file, "\n\t// Functions" + (expanded ? " (Expanded Inheritance)" : "") + "\n");
+	for (var i = 0; i < functions.length; i++) {
+		var func = functions[i];
+		var flagsText = func.flagNames.length > 0 ? func.flagNames.join("|") : "None";
+		if (expanded && CONFIG.AnnotateExpandedOwner) flagsText += " [Owner: " + func.ownerName + "]";
+		bufferedWrite(file, "\t// Flags: " + flagsText + "\n");
+		bufferedWrite(file, "\t" + func.retType + " " + func.funcName + "(" + func.params.join(", ") + ");" + func.locationSuffix + " // NumParms: " + func.numParms + "\n");
+	}
+	return true;
+}
+
+function getImplementingClass(hierarchy, slotOff, currentTarget) {
+	var provider = hierarchy[hierarchy.length - 1];
+	for (var i = hierarchy.length - 2; i >= 0; i--) {
+		var ancestorTarget = getValidVTableTarget(hierarchy[i].vtable, slotOff);
+		if (ancestorTarget.isNull()) continue;
+		if (ancestorTarget.compare(currentTarget) === 0) {
+			provider = hierarchy[i];
+			continue;
+		}
+		break;
+	}
+	return provider;
+}
+
+function collectVTableInfo(classPtr, superPtr) {
+	var key = classPtr.toString();
+	if (key in vtableInfoCache) return vtableInfoCache[key];
+
+	var info = {
+		cdo: ptr(0),
+		vtable: ptr(0),
+		hierarchy: [],
+		entries: [],
+	};
+
+	if (!CONFIG.EnableVTableDump) {
+		vtableInfoCache[key] = info;
+		return info;
+	}
+
+	var hierarchy = buildClassHierarchy(classPtr);
+	info.hierarchy = hierarchy;
+	if (hierarchy.length === 0) {
+		vtableInfoCache[key] = info;
+		return info;
+	}
+
+	var cdo = findClassDefaultObject(classPtr);
+	if (cdo.isNull()) {
+		vtableInfoCache[key] = info;
+		return info;
+	}
+
+	var vtable = safePtr(cdo);
+	if (vtable.isNull()) {
+		info.cdo = cdo;
+		vtableInfoCache[key] = info;
+		return info;
+	}
+
+	info.cdo = cdo;
+	info.vtable = vtable;
+
+	var superVTable = ptr(0);
+	if (CONFIG.VTableDumpMode === "diff" && !superPtr.isNull()) {
+		var superCDO = findClassDefaultObject(superPtr);
+		if (!superCDO.isNull()) superVTable = safePtr(superCDO);
+	}
+
+	var sawModuleEntry = false;
+	var invalidRun = 0;
+	for (var slotIndex = 0; slotIndex < CONFIG.VTableMaxSlots; slotIndex++) {
+		var slotOff = slotIndex * Process.pointerSize;
+		var target = getValidVTableTarget(vtable, slotOff);
+
+		if (target.isNull()) {
+			if (sawModuleEntry) {
+				invalidRun++;
+				if (invalidRun >= CONFIG.VTableStopAfterInvalid) break;
+			}
+			continue;
+		}
+
+		sawModuleEntry = true;
+		invalidRun = 0;
+
+		if (CONFIG.VTableDumpMode === "diff" && !superVTable.isNull()) {
+			var superTarget = getValidVTableTarget(superVTable, slotOff);
+			if (!superTarget.isNull() && superTarget.compare(target) === 0) continue;
+		}
+
+		var provider = getImplementingClass(hierarchy, slotOff, target);
+
+		info.entries.push({
+			slotOff: slotOff,
+			target: target,
+			offsetText: getModuleOffsetText(target),
+			implementorName: provider.name,
+			inherited: provider.ptr.compare(classPtr) !== 0,
+			uFunctionAnnotation: getVTableUFunctionAnnotation(target),
+		});
+	}
+
+	vtableInfoCache[key] = info;
+	return info;
+}
+
+function dumpClassVTable(classPtr, superPtr, file) {
+	var info = collectVTableInfo(classPtr, superPtr);
+	if (info.entries.length === 0) return false;
+
+	bufferedWrite(file, "\n\t// C++ VTable Inheritance Chain (" + CONFIG.VTableDumpMode + " via CDO)\n");
+	if (info.hierarchy.length > 0) {
+		bufferedWrite(file, "\t// Inheritance: " + getHierarchyText(info.hierarchy) + "\n");
+	}
+	bufferedWrite(file, "\t// CDO: " + info.cdo + " VTable: " + info.vtable + "\n");
+	for (var i = 0; i < info.entries.length; i++) {
+		var entry = info.entries[i];
+		bufferedWrite(
+			file,
+			"\t// [Slot: 0x" +
+				entry.slotOff.toString(16).toUpperCase() +
+				"] [ImplClass: " +
+				entry.implementorName +
+				(entry.inherited ? " inherited" : " override") +
+				"] [Offset: " +
+				entry.offsetText +
+				"]" +
+				entry.uFunctionAnnotation +
+				"\n"
+		);
+	}
+	return true;
 }
 
 function getNameByIndex(index) {
@@ -135,6 +618,38 @@ function outerChain(p) {
 	return parts.join("/");
 }
 
+function getObjectPath(p) {
+	if (p.isNull()) return "";
+	var outer = outerChain(p);
+	var name = fn(p);
+	return outer.length > 0 ? outer + "." + name : name;
+}
+
+function getBoundEnumPtr(propPtr) {
+	var propClass = cn(propPtr);
+	if (propClass === "EnumProperty") return safePtr(propPtr.add(CONFIG.UEnumProp_EnumOff));
+	if (propClass === "ByteProperty") return safePtr(propPtr.add(CONFIG.UByteProp_EnumOff));
+	return ptr(0);
+}
+
+function getBoundEnumPath(propPtr) {
+	var enumPtr = getBoundEnumPtr(propPtr);
+	if (enumPtr.isNull()) return "";
+	var enumClass = cn(enumPtr);
+	if (enumClass !== "Enum" && enumClass !== "UserDefinedEnum") return "";
+	return getObjectPath(enumPtr);
+}
+
+function getFieldTypeInfo(propPtr) {
+	var typeName = getPropType(propPtr);
+	var enumPath = getBoundEnumPath(propPtr);
+	if (typeName === "uint8" && enumPath) typeName = "enum";
+	return {
+		typeName: typeName,
+		enumPath: enumPath,
+	};
+}
+
 // Property type mapping
 var PROP_TYPE_MAP = {
 	Bool: "bool",
@@ -194,7 +709,7 @@ function dumpEnumValues(objPtr, file) {
 	var arrayNum = safeS32(objPtr.add(CONFIG.UEnum_NamesOff + 8));
 
 	if (arrayData.isNull() || arrayNum <= 0 || arrayNum > 10000) {
-		file.write("\t// (no enum values)\n");
+		bufferedWrite(file, "\t// (no enum values)\n");
 		return;
 	}
 
@@ -209,7 +724,7 @@ function dumpEnumValues(objPtr, file) {
 		if (!enumName) enumName = "<unknown>";
 		if (nameNum > 0) enumName += "_" + (nameNum - 1);
 
-		file.write("\t" + enumName + " = " + value + ",\n");
+		bufferedWrite(file, "\t" + enumName + " = " + value + ",\n");
 	}
 }
 
@@ -227,130 +742,35 @@ function dumpType(objPtr, file) {
 	var outer = outerChain(objPtr);
 
 	if (isEnum) {
-		file.write("// Enum " + outer + "." + objName + "\n");
-		file.write("enum " + objName + " {\n");
+		bufferedWrite(file, "// Enum " + outer + "." + objName + "\n");
+		bufferedWrite(file, "enum " + objName + " {\n");
 		try {
 			dumpEnumValues(objPtr, file);
 		} catch (_) {
-			file.write("\t// (error reading values)\n");
+			bufferedWrite(file, "\t// (error reading values)\n");
 		}
-		file.write("};\n\n");
+		bufferedWrite(file, "};\n\n");
 		return;
 	}
 
 	var superPtr = safePtr(objPtr.add(CONFIG.UStruct_SuperOff));
 	var superName = superPtr.isNull() ? "" : fn(superPtr);
 	var propSize = safeS32(objPtr.add(CONFIG.UStruct_PropSizeOff));
+	var expandedMembers = CONFIG.ExpandInheritedMembers;
 
-	file.write("// " + (isClass ? "Class" : "ScriptStruct") + " " + pkg + "." + objName + "\n");
-	file.write("// Size: 0x" + (propSize >>> 0).toString(16).toUpperCase() + "\n");
-	file.write((isClass ? "class " : "struct ") + objName);
-	if (superName) file.write(" : public " + superName);
-	file.write("\n{\n");
+	bufferedWrite(file, "// " + (isClass ? "Class" : "ScriptStruct") + " " + pkg + "." + objName + "\n");
+	bufferedWrite(file, "// Size: 0x" + (propSize >>> 0).toString(16).toUpperCase() + "\n");
+	bufferedWrite(file, (isClass ? "class " : "struct ") + objName);
+	if (superName) bufferedWrite(file, " : public " + superName);
+	bufferedWrite(file, "\n{\n");
 
-	// Traverse Children linked list — collect properties and functions
-	var child = safePtr(objPtr.add(CONFIG.UStruct_ChildrenOff));
-	var hasFields = false,
-		hasFuncs = false;
-	var depth = 0;
+	dumpFieldEntries(file, collectExpandedFields(objPtr), expandedMembers);
 
-	// First pass: properties
-	var fieldChild = child;
-	while (!fieldChild.isNull() && depth < 5000) {
-		var cc = cn(fieldChild);
-		if (cc.length > 8 && cc.substring(cc.length - 8) === "Property") {
-			if (!hasFields) {
-				file.write("\t// Fields\n");
-				hasFields = true;
-			}
-			try {
-				var propName = fn(fieldChild);
-				var typeName = getPropType(fieldChild);
-				var offset = safeS32(fieldChild.add(CONFIG.UProp_OffsetOff));
-				var elemSize = safeS32(fieldChild.add(CONFIG.UProp_ElementSizeOff));
-				var arrayDim = safeS32(fieldChild.add(CONFIG.UProp_ArrayDimOff));
+	if (isClass) dumpClassVTable(objPtr, superPtr, file);
 
-				var line = "\t" + typeName + " " + propName;
-				if (arrayDim > 1) line += "[" + arrayDim + "]";
-				line += "; // 0x" + (offset >>> 0).toString(16).toUpperCase();
-				line += " (Size: 0x" + (elemSize >>> 0).toString(16).toUpperCase() + ")";
-				file.write(line + "\n");
-			} catch (_) {}
-		}
-		fieldChild = safePtr(fieldChild.add(CONFIG.UField_NextOff));
-		depth++;
-	}
+	dumpFunctionEntries(file, collectExpandedFunctions(objPtr), expandedMembers);
 
-	// Second pass: functions
-	var funcChild = child;
-	depth = 0;
-	while (!funcChild.isNull() && depth < 5000) {
-		var fc = cn(funcChild);
-		if (fc === "Function") {
-			if (!hasFuncs) {
-				file.write("\n\t// Functions\n");
-				hasFuncs = true;
-			}
-			try {
-				var funcName = fn(funcChild);
-				var funcFlags = safeS32(funcChild.add(CONFIG.UFunc_FuncFlagsOff));
-				var numParms = safeS32(funcChild.add(CONFIG.UFunc_NumParmsOff)) & 0xff;
-
-				var flags = [];
-				if (funcFlags & 0x00000001) flags.push("Final");
-				if (funcFlags & 0x00000002) flags.push("Static");
-				if (funcFlags & 0x00000400) flags.push("Native");
-				if (funcFlags & 0x00000800) flags.push("Event");
-				if (funcFlags & 0x00002000) flags.push("NetMulticast");
-				if (funcFlags & 0x00020000) flags.push("Net");
-				if (funcFlags & 0x00200000) flags.push("BlueprintCallable");
-				if (funcFlags & 0x00400000) flags.push("BlueprintEvent");
-				if (funcFlags & 0x04000000) flags.push("Exec");
-
-				// Read function parameters via Children
-				var params = [];
-				var retType = "void";
-				var fparam = safePtr(funcChild.add(CONFIG.UStruct_ChildrenOff));
-				var pd = 0;
-				while (!fparam.isNull() && pd < 100) {
-					var pc = cn(fparam);
-					if (pc.length > 8 && pc.substring(pc.length - 8) === "Property") {
-						var pn = fn(fparam);
-						var pt = getPropType(fparam);
-						var pf = readPropFlags(fparam);
-						// CPF_ReturnParm = 0x400 (lo), CPF_Parm = 0x80 (lo), CPF_OutParm = 0x100 (lo)
-						if (pf.lo & 0x400) {
-							retType = pt;
-						} else if (pf.lo & 0x80) {
-							params.push((pf.lo & 0x100 ? "out " : "") + pt + " " + pn);
-						}
-					}
-					fparam = safePtr(fparam.add(CONFIG.UField_NextOff));
-					pd++;
-				}
-
-				// Read native function pointer at +0xB0
-				var funcPtr = safePtr(funcChild.add(CONFIG.UFunc_FuncPtrOff));
-				var funcOffset = "";
-				if (!funcPtr.isNull()) {
-					var off = funcPtr.sub(gBase);
-					// Check if pointer is within module range
-					if (off.compare(0) > 0 && off.compare(gModSize) < 0) {
-						funcOffset = " // [Offset: 0x" + off.toString(16).toUpperCase() + "]";
-					} else {
-						funcOffset = " // [Addr: " + funcPtr + "]";
-					}
-				}
-
-				file.write("\t// Flags: " + (flags.length > 0 ? flags.join("|") : "None") + "\n");
-				file.write("\t" + retType + " " + funcName + "(" + params.join(", ") + ");" + funcOffset + " // NumParms: " + numParms + "\n");
-			} catch (_) {}
-		}
-		funcChild = safePtr(funcChild.add(CONFIG.UField_NextOff));
-		depth++;
-	}
-
-	file.write("};\n\n");
+	bufferedWrite(file, "};\n\n");
 }
 
 // ===================== MAIN ==========================================
@@ -428,13 +848,20 @@ function runSDKDump() {
 	}
 
 	send({ type: "info", msg: "Found " + targets.length + " types" });
+	buildNativeUFunctionMap(targets);
 
 	var filePath = CONFIG.OutputDir + "dump.cs";
 	var file = new File(filePath, "w");
-	file.write("// UE4 SDK Dump v2\n");
-	file.write("// Generated by Frida UE4 Dumper\n");
-	file.write("// Target: com.tencent.tmgp.pubgmhd\n");
-	file.write("// Total: " + targets.length + " types\n\n");
+	bufferedWrite(file, "// UE4 SDK Dump v2\n");
+	bufferedWrite(file, "// Generated by Frida UE4 Dumper\n");
+	bufferedWrite(file, "// Target: com.tencent.tmgp.pubgmhd\n");
+	var includeParts = [];
+	includeParts.push(CONFIG.ExpandInheritedMembers ? "expanded inherited reflected fields/functions" : "reflected fields/functions");
+	includeParts.push("UFunction addresses");
+	if (CONFIG.EnableVTableDump) includeParts.push("C++ vtable inheritance chain (" + CONFIG.VTableDumpMode + ")");
+	if (CONFIG.AnnotateVTableUFunctions) includeParts.push("vtable to UFunction reverse matches");
+	bufferedWrite(file, "// Includes: " + includeParts.join(", ") + "\n");
+	bufferedWrite(file, "// Total: " + targets.length + " types\n\n");
 
 	var count = 0;
 	for (var i = 0; i < targets.length; i++) {
@@ -444,15 +871,17 @@ function runSDKDump() {
 		} catch (e) {
 			// Write a closing brace if we crashed mid-type
 			try {
-				file.write("}; // ERROR: " + e.message + "\n\n");
+				bufferedWrite(file, "}; // ERROR: " + e.message + "\n\n");
 			} catch (_) {}
 		}
 		if (count % 500 === 0 && count > 0) {
+			flushBuffered(file);
 			file.flush();
 			send({ type: "info", msg: "Progress: " + count + "/" + targets.length });
 		}
 	}
 
+	flushBuffered(file);
 	file.close();
 	send({ type: "info", msg: "SDK dump complete: " + count + " types -> " + filePath });
 	send({ type: "done", msg: "Done." });

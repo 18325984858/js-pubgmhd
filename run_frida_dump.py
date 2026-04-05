@@ -3,22 +3,45 @@
 UE4.18 Dump Launcher — 通过 Frida 注入 JS 脚本，文件直接写入设备
 目标: com.tencent.tmgp.pubgmhd (PUBG Mobile)
 
-使用方法:
-  1. 确保设备已连接, adb 可用, frida-server 已在设备上运行
-  2. 方式 A — 附加到已运行的游戏 (推荐, 等游戏加载到主界面后执行):
-       python run_frida_dump.py
-  3. 方式 B — 通过 Frida spawn 启动游戏:
-       python run_frida_dump.py --spawn
-  4. dump 完成后可选 --pull 自动 adb pull 文件到本地:
-       python run_frida_dump.py --pull
+常用命令:
+    1. 生成基础 dump:
+             python run_frida_dump.py
 
-设备端输出路径: /data/data/com.tencent.tmgp.pubgmhd/files/
-  - NamesDump.txt    所有 FName 索引 → 字符串
-  - ObjectsDump.txt  所有 UObject [索引] 类名 完整路径
-  - GWorldInfo.txt   当前 GWorld 信息
+    2. 生成 SDK 风格 dump.cs:
+             python run_frida_dump.py --sdk
+
+    3. 生成 SDK 风格 dump.cs 并自动拉取到本地 dump_output:
+             python run_frida_dump.py --sdk --pull
+
+    4. 如果游戏还没启动, 用 spawn 方式生成 SDK dump:
+             python run_frida_dump.py --sdk --spawn --pull
+
+    5. 指定自定义 JS 脚本:
+             python run_frida_dump.py --js frida_ue4_sdk_dump.js --pull
+
+执行前提:
+    1. 设备已连接, adb devices 可见
+    2. frida-server 已在设备上运行
+    3. 当前目录在 js-pubgmhd, 或使用该脚本的完整路径执行
+
+参数说明:
+    --sdk     生成 SDK 风格 dump.cs, 包含继承展开的字段/函数、完整 C++ vtable 继承链、以及 vtable 到 UFunction 的反向匹配注释
+    --spawn   通过 Frida spawn 启动游戏后再注入
+    --pull    dump 完成后自动 adb pull 到本地
+    --monitor 启动对局监控脚本
+    --js      手动指定要注入的 JS 文件
+
+设备端输出路径: /data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/
+    - dump.cs         SDK 风格导出结果
+    - NamesDump.txt   所有 FName 索引 → 字符串
+    - ObjectsDump.txt 所有 UObject [索引] 类名 完整路径
+    - GWorldInfo.txt  当前 GWorld 信息
+
+本地自动拉取目录:
+    ./dump_output/
 
 依赖:
-  pip install frida frida-tools
+    pip install frida frida-tools
 """
 
 import frida
@@ -59,6 +82,8 @@ def on_message(message, data):
             print(f"    {payload['msg']}")
         elif msg_type == "state_change":
             print(f"\n>>> {payload['msg']}\n")
+        elif msg_type == "players":
+            print(f"\n{payload['msg']}\n")
 
     elif message["type"] == "error":
         print(f"[ERROR] {message.get('description', '')}")
